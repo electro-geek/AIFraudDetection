@@ -6,104 +6,122 @@ import tempfile
 import soundfile as sf
 import os
 
+# --- INDIVIDUAL DETECTION STRATEGIES ---
+
+def detect_spectral_cutoff(y, sr):
+    """
+    STRATEGY 1: PHYSICS / FREQUENCY CUTOFF
+    Checks for hard frequency cutoffs often found in upsampled AI audio.
+    """
+    score = 0
+    reason = None
+    
+    # 1. Check Sampling Rate vs Rolloff
+    rolloff_99 = librosa.feature.spectral_rolloff(y=y, sr=sr, roll_percent=0.99)
+    avg_rolloff = np.mean(rolloff_99)
+    
+    # "HD" audio should have energy up to 16kHz+. AI often cuts at 11kHz.
+    if avg_rolloff < 12000 and sr > 24000:
+        score = 0.9 # High probability of Fake
+        reason = f"Unnatural frequency cutoff at {int(avg_rolloff)}Hz."
+    elif avg_rolloff < 8000:
+         score = 0.7 # Very low fidelity, suspicious
+         reason = "Extremely low frequency bandwidth."
+    else:
+        score = 0.1
+        reason = "Natural wide-band frequency response."
+        
+    return score, reason
+
+def detect_texture_anomaly(y, sr):
+    """
+    STRATEGY 2: STATISTICAL / TEXTURE
+    Checks for the 'perfect smoothness' of AI vs 'messy texture' of Humans using MFCCs.
+    """
+    # MFCC extraction
+    mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=20)
+    # Variance across time (how much the texture changes)
+    mfcc_var = np.mean(np.var(mfccs, axis=1)) 
+    
+    if mfcc_var < 500:
+        return 0.7, "Low vocal texture variance (too smooth)."
+    elif mfcc_var < 700:
+        return 0.4, "Moderately suppressed vocal details."
+    
+    return 0.1, "Rich, natural vocal texture."
+
+def detect_dynamics(y, sr):
+    """
+    STRATEGY 3: TEMPORAL DYNAMICS
+    Checks Zero Crossing Rate (ZCR) for natural rapid fluctuations.
+    """
+    zcr = librosa.feature.zero_crossing_rate(y)
+    zcr_var = np.var(zcr) # Variance of ZCR
+    
+    # Robots often have very stable ZCR. Humans are erratic.
+    if zcr_var < 0.005: 
+        return 0.6, "Unusually consistent zero-crossing rate."
+    
+    return 0.1, "Natural dynamic signal fluctuations."
+
+# --- MAIN AGGREGATOR ---
+
 def analyze_audio(request_data):
     """
-    Analyzes the audio data to determine if it is AI-generated or HUMAN.
-    Primary Logic: High-Frequency Cutoff Detection (Physics Based).
-    AI models often generate audio with a hard frequency cutoff (e.g., at 8kHz or 11kHz),
-    whereas real human recordings contain harmonics extending much higher.
+    Ensemble Classifier: Runs multiple distinct logic checks and polls the results.
     """
     try:
-        # 1. Decode Base64
+        # Decode and Load
         audio_bytes = base64.b64decode(request_data.audioBase64)
-        
-        # Write to a temporary file
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_audio:
             temp_audio.write(audio_bytes)
             temp_path = temp_audio.name
             
         try:
-            # 2. Load audio with librosa
-            # sr=None is CRITICAL here to detect the original sampling rate limits
             y, sr = librosa.load(temp_path, sr=None)
             
-            # --- PHYSICS-BASED LOGIC: HIGH FREQUENCY CUTOFF ---
+            # --- POLLING STAGE ---
             
-            score = 0
-            explanation_parts = []
+            # Run all strategies
+            results = [
+                detect_spectral_cutoff(y, sr),
+                detect_texture_anomaly(y, sr),
+                detect_dynamics(y, sr)
+            ]
             
-            # A. Check Sampling Rate / Nyquist Frequency
-            # Many TTS models output at 22050Hz or 24000Hz fixed.
-            nyquist_freq = sr / 2
+            # Aggregate scores
+            total_score = 0
+            explanations = []
+            weights = [0.5, 0.3, 0.2] # Cutoff is most reliable (0.5), then Texture (0.3), then Dynamics (0.2)
             
-            # B. Spectral Rolloff (The "Cutoff" Point)
-            # Find the frequency below which 99% of the total energy lies.
-            # Real recordings usually fill the spectrum up to the mic's limit.
-            rolloff_99 = librosa.feature.spectral_rolloff(y=y, sr=sr, roll_percent=0.99)
-            avg_rolloff = np.mean(rolloff_99)
+            for i, (score, reason) in enumerate(results):
+                weighted_score = score * weights[i]
+                total_score += weighted_score
+                if score > 0.4: # Only list reasons that flagged as suspicious
+                    explanations.append(reason)
             
-            # C. Energy Band Analysis
-            # Compare energy in the "High Band" (e.g., 10kHz+) vs "Low Band"
-            spectrogram = np.abs(librosa.stft(y))
-            frequencies = librosa.fft_frequencies(sr=sr)
+            # --- FINAL DECISION ---
             
-            # Define cutoff threshold (common AI artifact is ~11kHz due to 22k sr generation)
-            cutoff_freq = 11000 
+            # Normalize total score (max possible approx 0.9)
+            # Threshold: If weighted average > 0.45, we call it AI
             
-            # If the file itself has a low SR (e.g. 16k), it's low quality or old AI.
-            if nyquist_freq < 12000:
-                # Low resolution file - hard to distinguish, but suspicious context for "HD" voice
-                score += 0.2
-                explanation_parts.append(f"Low sampling rate ({sr}Hz) detected.")
-            else:
-                # File claims to be high res (e.g. 44.1k), let's check if it's empty upstairs
-                
-                # Check 1: The Hard Cutoff
-                # If 99% of energy is below 12kHz, but file supports up to 22kHz
-                if avg_rolloff < 12000:
-                    score += 0.6 # Strong indicator of AI upsampling
-                    explanation_parts.append(f"Unnatural hard frequency cutoff detected at {int(avg_rolloff)}Hz.")
-                
-                # Check 2: High Frequency "Dead Zone"
-                high_band_idx = np.where(frequencies > 13000)[0]
-                if len(high_band_idx) > 0:
-                    high_band_energy = np.mean(spectrogram[high_band_idx, :])
-                    # If effectively zero energy despite high SR container
-                    if high_band_energy < 0.01:
-                        score += 0.3
-                        explanation_parts.append("Absence of natural high-frequency harmonics.")
-
-            # --- SECONDARY CHECKS (Backup) ---
-            # Used to confirm ambiguous cases
-            
-            # Texture Check (MFCC Variance) - AI is too smooth
-            mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=20)
-            mfcc_var = np.mean(np.var(mfccs, axis=1))
-            if mfcc_var < 500:
-                score += 0.2
-                explanation_parts.append("Lacks vocal texture variance.")
-
-            # --- CLASSIFICATION DECISION ---
-            
-            threshold = 0.5
-            
-            if score >= threshold:
+            if total_score >= 0.45:
                 classification = "AI_GENERATED"
-                confidenceScore = min(0.6 + (score * 0.4), 0.99)
-                explanation = " ".join(explanation_parts)
+                # Map score to confidence (0.45->0.70, 0.9->0.99)
+                confidenceScore = min(0.70 + (total_score * 0.3), 0.99)
+                final_explanation = " | ".join(explanations) if explanations else "Multiple synthetic anomalies detected."
             else:
                 classification = "HUMAN"
-                confidenceScore = 0.88
-                explanation = "Full frequency spectrum usage and natural harmonics detected."
+                confidenceScore = 0.85 + (0.1 * (1.0 - total_score)) # Higher confidence if score is low
+                final_explanation = "Passed multiple signal authenticity checks (Spectral, Texture, Dynamics)."
             
             return {
                 "classification": classification,
                 "confidenceScore": round(confidenceScore, 2),
-                "explanation": explanation
+                "explanation": final_explanation
             }
             
         finally:
-            # cleanup temp file
             if os.path.exists(temp_path):
                 os.remove(temp_path)
 
